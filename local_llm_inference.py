@@ -9,32 +9,34 @@ HW4 LLM Tool Calling Agent — 本地 GGUF 推論版 (llama-cpp-python)。
   5. 每筆即時 flush，可斷點續跑
 
 差異：
-  - 不打 API、直接本地推論；無 rate limit、無 worker pool
-  - 單卡 / 多卡：用 --n-gpu-layers (-1 = 全部 offload) + llama.cpp 內建 tensor split
-    多卡時 llama.cpp 預設會把 layers 自動平均分配，也可用 --tensor-split 自訂
-  - 不需 api_key.txt
+  - 不打 API、直接本地推論；不需 api_key.txt
+  - 單卡 / 雙卡 (本腳本只支援 1 或 2 張)：
+      * 單卡：模型整顆裝在那張，sequential 推論
+      * 雙卡：每張卡各載入一份完整模型，thread pool 平行分派樣本
+        → 接近 2× 加速 (兩張卡沒有跨卡通訊)
 
 用法 (conda env: NLP2)：
-  # 單卡 (預設 device 0)：
-  CUDA_VISIBLE_DEVICES=0 python local_llm_inference.py \
-      --gguf models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf
-
-  # 雙卡 (layer split，預設行為)：
+  # 單卡 (預設 GPU 0)：
   python local_llm_inference.py \
-      --gguf models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf
+      --gguf models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf \
+      --devices 0
 
-  # 雙卡自訂比例 (例：0=12GB / 1=24GB → 1:2)：
-  python local_llm_inference.py --gguf <path> --tensor-split 1,2
+  # 雙卡平行：
+  python local_llm_inference.py \
+      --gguf models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf \
+      --devices 0,1
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as _dt
 import json
 import os
 import re
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Set
 
@@ -245,25 +247,19 @@ def default_output_dir(model_path: str) -> str:
 
 def make_llama(
     gguf_path: str,
+    device_idx: int,
     n_gpu_layers: int,
     n_ctx: int,
     n_threads: int,
-    tensor_split: Optional[List[float]],
-    main_gpu: int,
-    split_mode: str,
     n_batch: int,
     seed: int,
     chat_format: Optional[str],
 ):
+    """載入一份 Llama 實例、整顆模型 pin 到 device_idx 這張 GPU。"""
     global Llama
     if Llama is None:
         from llama_cpp import Llama as _Llama  # 延遲 import
         Llama = _Llama
-
-    # split_mode: "none" → 全部裝在 main_gpu；"layer" → 按層分到所有可見 GPU；
-    # "row" → 按 row 切 tensor (對 mat-mul 較吃通訊頻寬，多卡反而慢)
-    SPLIT_MODE_MAP = {"none": 0, "layer": 1, "row": 2}
-    split_mode_int = SPLIT_MODE_MAP.get(split_mode, 1)
 
     kwargs = dict(
         model_path=gguf_path,
@@ -273,21 +269,32 @@ def make_llama(
         n_batch=n_batch,
         seed=seed,
         verbose=False,
-        main_gpu=main_gpu,
-        split_mode=split_mode_int,
+        main_gpu=device_idx,
+        split_mode=0,  # LLAMA_SPLIT_MODE_NONE — 整顆放在 main_gpu，不跨卡通訊
     )
-    if tensor_split:
-        kwargs["tensor_split"] = tensor_split
     if chat_format:
         kwargs["chat_format"] = chat_format
 
-    log(f"[INFO] 載入 GGUF: {gguf_path}")
-    log(f"[INFO] n_gpu_layers={n_gpu_layers}, n_ctx={n_ctx}, split_mode={split_mode}, "
-        f"tensor_split={tensor_split}, main_gpu={main_gpu}, n_batch={n_batch}")
+    log(f"[INFO] 載入 GGUF 到 GPU {device_idx}: {gguf_path}")
     t0 = time.time()
     llm = Llama(**kwargs)
-    log(f"[INFO] 模型載入完成，耗時 {time.time() - t0:.1f} s")
+    log(f"[INFO] GPU {device_idx} 模型載入完成，耗時 {time.time() - t0:.1f} s "
+        f"(n_ctx={n_ctx}, n_batch={n_batch}, n_gpu_layers={n_gpu_layers})")
     return llm
+
+
+class LlmWorker:
+    """一張 GPU + 一份 Llama 實例 + 一把獨佔鎖。
+
+    Llama.create_completion 對單一 instance 不是 thread-safe (內部會動到
+    KV cache state)；用 lock 確保同一個 instance 一次只跑一個 sample，
+    但不同 instance (在不同 GPU 上) 可以同時跑。
+    """
+
+    def __init__(self, llm, device_idx: int) -> None:
+        self.llm = llm
+        self.device_idx = device_idx
+        self.lock = threading.Lock()
 
 
 def _wrap_qwen3_no_think(user_msg: str) -> str:
@@ -420,12 +427,10 @@ def run_pipeline(
     output_csv: str,
     backup_json: str,
     gguf_path: str,
+    devices: List[int],
     n_gpu_layers: int,
     n_ctx: int,
     n_threads: int,
-    tensor_split: Optional[List[float]],
-    main_gpu: int,
-    split_mode: str,
     n_batch: int,
     seed: int,
     chat_format: Optional[str],
@@ -463,30 +468,35 @@ def run_pipeline(
         log("無待處理樣本，已寫出 submission/backup。")
         return
 
-    llm = make_llama(
-        gguf_path=gguf_path,
-        n_gpu_layers=n_gpu_layers,
-        n_ctx=n_ctx,
-        n_threads=n_threads,
-        tensor_split=tensor_split,
-        main_gpu=main_gpu,
-        split_mode=split_mode,
-        n_batch=n_batch,
-        seed=seed,
-        chat_format=chat_format,
-    )
+    # 為每張 GPU 載入一份模型 (1 或 2 張)
+    log(f"準備在 {len(devices)} 張 GPU 上各載入一份模型: {devices}")
+    workers: List[LlmWorker] = []
+    for dev in devices:
+        llm = make_llama(
+            gguf_path=gguf_path, device_idx=dev,
+            n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
+            n_threads=n_threads, n_batch=n_batch,
+            seed=seed, chat_format=chat_format,
+        )
+        workers.append(LlmWorker(llm, dev))
+    n_workers = len(workers)
+    log(f"[INFO] 共 {n_workers} 條 worker thread (一條對應一張 GPU)")
 
+    results_lock = threading.Lock()
+    save_lock = threading.Lock()
     completed = 0
     unresolved: List[int] = []
-    with tqdm(total=len(samples), initial=skipped, desc="處理", unit="q",
-              dynamic_ncols=True) as bar:
-        bar.set_postfix(miss=0)
-        for sample in to_process:
-            sid = sample["id"]
+    total = len(to_process)
+
+    def _worker_fn(sample: dict, worker_idx: int) -> str:
+        sid = sample["id"]
+        w = workers[worker_idx]
+        with results_lock:
             prev = results_by_id.get(sid)
-            try:
+        try:
+            with w.lock:
                 result = process_sample(
-                    llm, sample,
+                    w.llm, sample,
                     max_attempts=max_attempts,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -494,18 +504,37 @@ def run_pipeline(
                     disable_thinking=disable_thinking,
                     previous_best=prev,
                 )
-            except Exception as exc:  # pragma: no cover
-                log(f"[WARN] id={sid} 發生例外，保留舊值: {exc}")
-                result = prev or {
-                    "id": sid,
-                    "current_step": sample.get("current_step", ""),
-                    "prompt": "",
-                    "predicted_answer": "",
-                    "model_raw_response": "",
-                }
+        except Exception as exc:  # pragma: no cover
+            log(f"[WARN] id={sid} (GPU {w.device_idx}) 發生例外，保留舊值: {exc}")
+            result = prev or {
+                "id": sid,
+                "current_step": sample.get("current_step", ""),
+                "prompt": "",
+                "predicted_answer": "",
+                "model_raw_response": "",
+            }
+        with results_lock:
             results_by_id[sid] = result
+        return result.get("predicted_answer", "") or ""
 
-            letter = result.get("predicted_answer", "") or ""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex, \
+            tqdm(total=len(samples), initial=skipped, desc="處理", unit="q",
+                 dynamic_ncols=True) as bar:
+        bar.set_postfix(miss=0)
+        # round-robin 把每筆樣本分派給某張 GPU 的 worker
+        future_to_sample = {
+            ex.submit(_worker_fn, sample, i % n_workers): sample
+            for i, sample in enumerate(to_process)
+        }
+        for future in concurrent.futures.as_completed(future_to_sample):
+            sample = future_to_sample[future]
+            sid = sample["id"]
+            try:
+                letter = future.result()
+            except Exception as exc:  # pragma: no cover
+                log(f"[WARN] id={sid} worker 失敗: {exc}")
+                letter = ""
+
             if not letter:
                 unresolved.append(sid)
 
@@ -513,18 +542,20 @@ def run_pipeline(
             bar.set_postfix(miss=len(unresolved))
             bar.update(1)
 
-            if completed % save_every == 0 or completed == len(to_process):
-                rows = _build_submission_rows(samples, results_by_id)
-                try:
-                    save_outputs(output_csv, backup_json, rows, results_by_id)
-                except Exception as exc:
-                    log(f"[WARN] 寫檔失敗，跳過此次 flush，下次再試: {exc}")
+            if completed % save_every == 0 or completed == total:
+                with save_lock, results_lock:
+                    rows = _build_submission_rows(samples, results_by_id)
+                    try:
+                        save_outputs(output_csv, backup_json, rows, results_by_id)
+                    except Exception as exc:
+                        log(f"[WARN] 寫檔失敗，跳過此次 flush，下次再試: {exc}")
 
-    rows = _build_submission_rows(samples, results_by_id)
-    try:
-        save_outputs(output_csv, backup_json, rows, results_by_id)
-    except Exception as exc:
-        log(f"[WARN] 最終寫檔失敗，請手動重跑: {exc}")
+    with save_lock, results_lock:
+        rows = _build_submission_rows(samples, results_by_id)
+        try:
+            save_outputs(output_csv, backup_json, rows, results_by_id)
+        except Exception as exc:
+            log(f"[WARN] 最終寫檔失敗，請手動重跑: {exc}")
 
     log("\n" + "=" * 60)
     log(f"完成。樣本總數 {len(samples)}：沿用 {skipped} 筆 / 重打 {len(to_process)} 筆")
@@ -539,10 +570,24 @@ def run_pipeline(
 # CLI
 # ---------------------------------------------------------------------------
 
-def _parse_tensor_split(s: Optional[str]) -> Optional[List[float]]:
-    if not s:
-        return None
-    return [float(x) for x in re.split(r"[,;\s]+", s.strip()) if x]
+def _parse_devices(s: str) -> List[int]:
+    """parse "0" / "1" / "0,1" → [0] / [1] / [0,1]。僅允許 1 或 2 張卡。"""
+    parts = [p for p in re.split(r"[,;\s]+", s.strip()) if p]
+    try:
+        devices = [int(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--devices 必須是整數或以逗號分隔的整數，例如 '0' 或 '0,1' (got {s!r})"
+        ) from exc
+    if not devices:
+        raise argparse.ArgumentTypeError("--devices 不能為空")
+    if len(devices) > 2:
+        raise argparse.ArgumentTypeError(
+            f"本腳本只支援單卡或雙卡，--devices 最多 2 個 (got {devices})"
+        )
+    if len(set(devices)) != len(devices):
+        raise argparse.ArgumentTypeError(f"--devices 重複了 ({devices})")
+    return devices
 
 
 def parse_args() -> argparse.Namespace:
@@ -561,17 +606,13 @@ def parse_args() -> argparse.Namespace:
                         help="GGUF 檔絕對 / 相對路徑")
     parser.add_argument("--chat-format", default=None,
                         help="llama_cpp chat_format (預設讓 llama.cpp 自動從 GGUF metadata 偵測)")
-    # GPU layout
+    # GPU layout — 單卡或雙卡
+    parser.add_argument("--devices", type=_parse_devices, default=[0],
+                        help="要使用的 GPU index，例如 '0' (單卡) 或 '0,1' (雙卡平行)。"
+                             "雙卡時每張卡會各載入一份完整模型，由 thread pool 平行分派樣本。"
+                             "本腳本只支援 1 或 2 張卡。")
     parser.add_argument("--n-gpu-layers", type=int, default=-1,
-                        help="offload 到 GPU 的層數，-1 = 全部 (預設 -1)")
-    parser.add_argument("--tensor-split", default=None,
-                        help="多卡分配比例，例如 '1,1' (兩卡均分)、'1,2' (1/3 vs 2/3)；"
-                             "不指定就 layer 平均分")
-    parser.add_argument("--main-gpu", type=int, default=0,
-                        help="主 GPU index (split_mode=none 時模型全部裝在這張)")
-    parser.add_argument("--split-mode", default="layer",
-                        choices=["none", "layer", "row"],
-                        help="多卡切分模式 (預設 layer)")
+                        help="每張卡 offload 到 GPU 的層數，-1 = 全部 (預設 -1)")
     # llama.cpp runtime
     parser.add_argument("--n-ctx", type=int, default=4096,
                         help="context 長度 (預設 4096，27B Q4 + KV cache 剛好塞滿單張 4090)")
@@ -610,12 +651,10 @@ def main() -> None:
         output_csv=output_csv,
         backup_json=backup_json,
         gguf_path=args.gguf,
+        devices=args.devices,
         n_gpu_layers=args.n_gpu_layers,
         n_ctx=args.n_ctx,
         n_threads=args.n_threads,
-        tensor_split=_parse_tensor_split(args.tensor_split),
-        main_gpu=args.main_gpu,
-        split_mode=args.split_mode,
         n_batch=args.n_batch,
         seed=args.seed,
         chat_format=args.chat_format,

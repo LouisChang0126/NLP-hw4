@@ -4,3 +4,4 @@ kaggle.json
 outputs/
 *.log
 *.gguf
+models/
