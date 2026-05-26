@@ -1,3 +1,6 @@
 api_key.txt
 __pycache__/
 kaggle.json
+outputs/
+*.log
+*.gguf

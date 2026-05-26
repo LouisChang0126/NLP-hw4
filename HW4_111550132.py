@@ -14,7 +14,7 @@ End-to-end:
       --backup llm_answering_results.json --max-attempts 10 \
       --rate 37 --workers 4
 
-設計重點 (沿用 HW3)：
+設計重點：
   - Windows cp950 主控台相容：強制 stdout 為 utf-8、純文字訊息
   - 不會因 API timeout / 空回應 / 解析失敗而崩潰；該筆持續重試
   - 多 API key：api_key.txt 一行一把，N 把 key → 自動開 (N × --workers) 條 thread，
@@ -101,8 +101,8 @@ class RateLimiter:
 # ---------------------------------------------------------------------------
 
 INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-# HW4 規範：open-weight、≤ 80B。Gemma / Llama-3.1-70B / Qwen3 都合法。
-MODEL_NAME = "google/gemma-3-27b-it"
+# 規範：open-weight、≤ 80B。
+MODEL_NAME = "google/gemma-4-31b-it"
 
 
 def slugify_model_name(name: str) -> str:
