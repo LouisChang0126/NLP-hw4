@@ -71,10 +71,7 @@ Prompt + parser 與`HW4_111550132.py`完全對齊，方便 Q2 比較。
 
 == Experimental Setup
 
-*Prompt* 與 *SFT* 兩條 pipeline 跑在 *同一顆模型* 上。考慮：
-
-- 提交用的 `gemma-4-31b-it` 透過 NIM API 提供，*無法做 fine-tune*；
-- 使用 Qwen3.6-27B *做 QLoRA fine-tune*。
+*Prompt* 與 *SFT* 兩條 pipeline 跑在同一顆模型 *Qwen3.6-27B* 上，使用 4-bit *QLoRA fine-tune*。
 
 所有實驗的 dev set 為從 `train.jsonl` 取最後 1000 筆 (`build_or_load_dev_split`，由 `data/dev.jsonl` 落盤，兩種 prompt mode 共用同一份 dev 確保可比性)。SFT 訓練資料則排除這 1000 筆 dev id，避免污染評估。
 
@@ -117,20 +114,20 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
 
 *Full-Info 較佳 (97.60% > 91.19%)。* 可能原因：
 
-+ *Tool name 本身就是有意義的訊號*。工具命名是 verb-noun 結構 (例：`train_ticket_booking`, `search_accommodation`)，model 可以直接以 `current_step` 的動詞 (book / search / query / cancel) 與 tool name 做表面 string match。一旦把 name 拔掉，這條捷徑就斷了。
-+ *Description 是 argument key 的「中介編碼」*。例如 argument key `seatType` 在 Full-Info 下被 description "Seat type (Hard sleeper / Soft sleeper)" 強化語意，Structural-Only 下只剩裸鍵名，model 必須完全靠鍵名 + 上下文推論其用途。雖然鍵名命名規則 (snake_case / camelCase) 通常還能讓 model 部分解讀，但失去描述會在 *鍵名相似但語意不同* 的工具上產生混淆。
-+ *Ambiguity 錯誤比例上升*。Full 模式 11/24=45.8% 是 ambiguity 錯誤，Struct 模式跳升到 48/88=54.5%。也就是說，Struct 額外多出來的 64 個錯誤中，有約 (48-11)/64≈58% 來自工具名/描述被拿掉後 model 把語意相近的工具混在一起 (詳見 Q3)。
++ *Tool name 本身就是有意義的訊號*。工具命名是 verb-noun 結構 (例：`train_ticket_booking`, `search_accommodation`)，model 可以直接以 `current_step` 的動詞 (book / search / query / cancel) 與 tool name 做表面 string match。一旦移除工具名稱，模型便無法利用此特徵。
++ *Description 是 argument key 的「中介編碼」*。例如 argument key `seatType` 在 Full-Info 下被 description "Seat type (Hard sleeper / Soft sleeper)" 強化語意，Structural-Only 下僅剩鍵名本身，model 必須完全靠鍵名 + 上下文推論其用途。雖然鍵名命名規則 (snake_case / camelCase) 通常還能讓 model 部分解讀，但失去描述會在 *鍵名相似但語意不同* 的工具上產生混淆。
++ *Ambiguity 錯誤比例上升*。Full 模式 11/24=45.8% 是 ambiguity 錯誤，Struct 模式跳升到 48/88=54.5%。也就是說，Struct 額外多出來的 64 個錯誤中，有約 (48-11)/64≈58% 來自工具名/描述被拿掉後 model 把語意相近的工具混在一起。
 
 == SFT: Full-Info vs Structural-Only
 
-*SFT 後兩配置幾乎打平 (99.10% #sym.approx 99.00%)，遠小於 Prompt-only 階段的 6.4 pp。*兩個觀察：
+*SFT 後兩配置幾乎打平 (99.10% ≈ 99.00%)，遠小於 Prompt-only 階段的 6.4 pp。*兩個觀察：
 
 + *SFT 把「依靠 description」的捷徑內化為權重*。Prompt-only 階段，Full-Info 多出來的優勢來自 tool name 與 description 提供的語意 grounding；經過 1 epoch 的監督微調，模型在 train 分布內已經把 (schema → 答案) 的映射寫入 LoRA adapter，descriptions 不再是唯一資訊源。Structural-Only 因此能追上 Full-Info。
-+ *Structural-Only 進步幅度最大* (91.19% → 99.00%, +7.8 pp)，遠大於 Full-Info (97.60% → 99.10%, +1.5 pp)。這正好說明 SFT 替缺乏描述的 Structural-Only 「補上」了原本仰賴 prompt 內描述帶來的訊息，把對 schema 結構的解析能力直接寫進權重中。
++ *Structural-Only 進步幅度最大* (91.19% → 99.00%, +7.8%)，遠大於 Full-Info (97.60% → 99.10%, +1.5%)。這正好說明 SFT 替缺乏描述的 Structural-Only 「補上」了原本仰賴 prompt 內描述帶來的訊息，把對 schema 結構的解析能力直接寫進權重中。
 
-整體比較：在 *Prompt-based* 設定下，*Full-Info 勝出* (差 6.4 pp)；在 *SFT* 設定下，*Full-Info 仍微幅勝出* (差 0.1 pp)，但兩者已收斂到同一水平。SFT 在這個任務上對兩種 prompt 配置都有顯著提升，且讓 Structural-Only 設定變得實質可用。
+整體比較：在 *Prompt-based* 設定下，*Full-Info 勝出* (差 6.4%)；在 *SFT* 設定下，*Full-Info 仍微幅勝出* (差 0.1%)，但兩者已收斂到同一水平。SFT 在這個任務上對兩種 prompt 配置都有顯著提升，且讓 Structural-Only 設定變得實質可用。
 
-= Q3. Tool Ambiguity and Misselection (10%)
+= Q3. Overcoming Tool Ambiguity and Misselection (10%)
 
 == 處理 Ambiguity 的策略
 
@@ -143,8 +140,8 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
   against what the current step actually requires.
   ```
   把真實歧義對直接放進 prompt，引導 model 不要只看 tool name 表面。
-+ *把工具的 schema 攤平丟給 model*。除了 name + description，我們把 `arguments.properties` 與 `results.properties` 的 *每個 (key, type, description)* 都列在 prompt 內，等於把 OpenAPI-style schema 直接餵給模型，讓它能用「需要哪些輸入 / 會產生哪些輸出」這兩個鈎子做二次驗證，而不只是看名字。
-+ *Multi-tier answer parser + retry*。即使 model 在 ambiguity 下吐出像 "Maybe G but probably B" 這種猶豫式答案，五級 fallback 解析也會擇一合法 letter；若整段回應失敗 (timeout / 空字串)，則重打到指定次數。
++ *把工具的 schema 攤平丟給 model*。除了 name + description，我們把 `arguments.properties` 與 `results.properties` 的 *每個 (key, type, description)* 都列在 prompt 內，等於把 OpenAPI-style schema 直接送入模型，讓它能用「需要哪些輸入 / 會產生哪些輸出」這兩個鈎子做二次驗證，而不只是看名字。
++ *Multi-tier answer parser + retry*。即使 model 在 ambiguity 下輸出像 "Maybe G but probably B" 這種猶豫式答案，五級 fallback 解析也會擇一合法 letter；若整段回應失敗 (timeout / 空字串)，則重打到指定次數。
 
 實驗顯示，這套組合在 Full-Info 設定下把 dev ambiguity 錯誤壓到 11 題 / 999 (1.1%)。
 
@@ -190,16 +187,10 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
 
 == 觀察
 
-+ *接近一半 (Prompt) 到超過一半 (SFT) 的錯誤都源自 ambiguity*。即使在表現最好的 SFT + Full-Info 上 (accuracy 99.10%)，剩下的 9 個錯題中仍有 5 個 (55.6%) 屬於「預測了 token-相似 ≥ 40% 的工具」。model 並非什麼都做不到，而是在「兩個名字相近、做的事情不同」這類細節上會卡住。
++ *接近一半 (Prompt) 到超過一半 (SFT) 的錯誤都源自 ambiguity*。即使在表現最好的 SFT + Full-Info 上 (accuracy 99.10%)，剩下的 9 個錯題中仍有 5 個 (55.6%) 屬於「預測了 token-相似 ≥ 40% 的工具」。model 並非什麼都做不到，而是在「兩個名字相近、做的事情不同」這類細節上容易產生誤判。
 + *拿掉 descriptions 會在 Prompt 階段顯著放大 ambiguity 比例 (45.8% → 54.5%)*。當 model 無法靠描述 (e.g. "Used for booking" vs "Used for cancellation") disambiguate 時，會更依賴 name 的字面相似度，這正好就是 ambiguity 錯誤的定義。
 + *SFT 後 ambiguity 比例反而上升 (Full 45.8% → 55.6%; Struct 54.5% → 60.0%)*。乍看反直覺，實際上是「總錯誤數大幅下降，剩下的都是真正困難的 ambiguity case」——SFT 把容易的、可由表面特徵分辨的 case 全部學會，沒解決的剛好就是那些 token 級別高度重疊、必須依靠語意理解的邊界 case。
 + *主要混淆對為 A↔B*。在四個設定下 top confusion 皆為 `B→A` 與 `A→B`，反映 `train.jsonl` 的選項分布 (大多只提供 A-D)，且 A、B 往往是同一家族 (例如 `search_train` 與 `train_ticket_query`) 的兩個變體。
-
-== 後續可嘗試的改進
-
-- *Few-shot prompt augmentation*：從 `train.jsonl` 抽出 ambiguity 配對較多的樣本當作 in-context exemplar。
-- *Self-consistency*：對同一筆樣本用較高 temperature 跑數次，多數決抽 letter，預期可進一步降 ambiguity error。
-- *SFT 後 inference*：若 SFT 跑完 dev accuracy 提升，表示 model 已把 ambiguity 對映關係內化，prompt 可以更短。
 
 = Appendix: Code Layout
 
@@ -221,3 +212,19 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
   [`data/dev.jsonl`],
   [從 `train.jsonl` 取最後 1000 筆，所有 dev 實驗共用同一份以確保 4-cell 可比性],
 )
+
+== 執行方式 (`HW4_111550132.py`)
+
+*前置*：在執行目錄下放 `api_key.txt` (NVIDIA NIM key)，並把 `test.jsonl` 放在 `data/test.jsonl`。
+```
+python HW4_111550132.py \
+    --input data/test.jsonl \
+    --output submission.csv \
+    --backup llm_answering_results.json \
+    --model google/gemma-4-31b-it \
+    --max-attempts 10 \
+    --rate 37 \
+    --workers 4
+```
+
+*Resume*：腳本每完成一筆就 flush CSV 與 backup JSON，中斷後再次執行只會重打仍無合法 letter 的 id；既有正確答案會直接沿用。
