@@ -229,8 +229,18 @@ def main() -> None:
         args=sft_cfg,
     )
 
-    log("[INFO] 開始訓練...")
-    trainer.train()
+    # 自動偵測 output_dir 內最新 checkpoint，存在就 resume
+    import glob
+    ckpts = sorted(
+        glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
+        key=lambda p: int(p.rsplit("-", 1)[-1]),
+    )
+    resume = ckpts[-1] if ckpts else None
+    if resume:
+        log(f"[INFO] 偵測到既有 checkpoint，從 {resume} 接力訓練")
+    else:
+        log("[INFO] 從頭開始訓練...")
+    trainer.train(resume_from_checkpoint=resume)
     log("[INFO] 訓練結束，存 LoRA adapter...")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)

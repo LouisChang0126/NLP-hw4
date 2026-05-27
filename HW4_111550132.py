@@ -135,16 +135,24 @@ def load_api_keys(filepath: str) -> List[str]:
 
 
 def query_llm(prompt: str, api_key: str, model_name: str, timeout: float) -> str:
+    """Concise variant：max_tokens=4 + stop=["\n"]，並用 assistant prefix trick
+    預填 "Answer: "，讓模型只需生 1-2 個 token (字母 + 可能的標點)。"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
     }
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": prompt},
+            # Assistant prefix trick：把 "Answer: " 預填進 assistant 訊息，
+            # vLLM/TensorRT-LLM backed NIM 多半會把這當成 generation prefix 繼續。
+            {"role": "assistant", "content": "Answer: "},
+        ],
+        "max_tokens": 4,
         "temperature": 0.0,
         "top_p": 0.1,
+        "stop": ["\n"],
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -231,29 +239,20 @@ def _format_tool(letter: str, tool: dict) -> str:
 
 
 def build_prompt(full_context: str, current_step: str, options: Dict[str, dict]) -> str:
+    """Concise / HW3-style：簡短指令、強制只吐字母、零解釋。"""
     options_block = "\n".join(
         _format_tool(letter, options[letter]) for letter in sorted(options.keys())
     )
     valid_letters = ", ".join(sorted(options.keys()))
     return (
-        "You are an expert tool-calling agent. Given the historical context of a user's task, "
-        "the current sub-step to be executed, and a list of candidate tools, your job is to "
-        "select the SINGLE correct tool whose name, arguments, and returned results best "
-        "match what the current step needs to do.\n\n"
-        "Reasoning guidelines:\n"
-        "  - Match the tool's *action* (its name + description) to the current step's verb (query / search / book / confirm / etc.).\n"
-        "  - Two tools may have similar names (e.g. `search_train` vs `query_past_ticket`); "
-        "disambiguate by carefully comparing each tool's argument keys and result keys against "
-        "what the current step actually requires.\n"
-        "  - Prefer the tool whose required inputs are already available in the full_context.\n"
-        "  - The current_step's wording is the strongest signal — only one option will fit exactly.\n\n"
-        f"Full context (the user's overall plan so far):\n{full_context}\n\n"
-        f"Current step (the sub-task to execute right now):\n{current_step}\n\n"
+        "You are an expert tool-calling agent. Given the user's task context and the current step, "
+        "select the correct tool from the candidate options.\n\n"
+        f"Full context:\n{full_context}\n\n"
+        f"Current step:\n{current_step}\n\n"
         f"Candidate tools:\n{options_block}\n\n"
         f"Valid option letters: {valid_letters}\n"
-        "Think briefly, then output ONLY the final answer on its own line in this exact format:\n"
-        "Answer: <LETTER>\n"
-        "where <LETTER> is one of the valid option letters above. Do not output anything after that line."
+        "Output ONLY a single uppercase letter from the valid options corresponding to the correct tool. "
+        "No explanation, no analysis, no other text. (e.g., D)"
     )
 
 
