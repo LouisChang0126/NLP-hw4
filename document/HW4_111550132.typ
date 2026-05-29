@@ -229,8 +229,6 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
   [Dev set SFT 後評估 (transformers + peft adapter)，沿用 `run_dev_eval` 的 prompt 與 evaluation 邏輯],
   [`predict_sft.py`],
   [Test set SFT 後推論 (transformers + peft adapter)，雙卡平行；輸出可供 Kaggle 提交],
-  [`data/dev.jsonl`],
-  [從 `train.jsonl` 取最後 1000 筆，所有 dev 實驗共用同一份以確保 4-cell 可比性],
 )
 
 == 執行方式 (`HW4_111550132.py`)
