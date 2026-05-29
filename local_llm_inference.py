@@ -1,25 +1,28 @@
 """
-HW4 NIM gemma-4-31b-it + ambiguity-heavy 3-shot in-context inference.
+HW4 Local Qwen3.6-27B + ambiguity-heavy 3-shot in-context inference.
 
-- 後端：NVIDIA NIM Chat Completion API (`google/gemma-4-31b-it`)
+- 後端：llama-cpp-python 載入 Qwen3.6-27B GGUF (預設 Q4_K_M)
 - Prompt：concise + 3 個 ambiguity-heavy 範例 (train ids 3961/9642/3547)
 - 範例設計：
     id=3961 (gold C, 4 工具全 `home_cleaning_*`，6 對歧義)
     id=9642 (gold E, 5 工具 `foreign_currency_*`，3 對歧義)
     id=3547 (gold C, train_ticket_query/cancelling/booking + search_train)
-- API 設定：T=0.1 top_p=0.95 + assistant prefix `Answer: ` + max_tokens=4 + stop=["\n"]
-- 多 API key：api_key.txt 一行一把，N 把 key 各自獨立 rate limit
 - 後處理：multi-tier regex 抽單一 letter
+- GPU：單卡或雙卡 (雙卡時各載一份模型，thread pool 平行)
 
-用法：
-  python HW4_111550132.py
-  python HW4_111550132.py --workers 8 --rate 37
+用法 (conda env: NLP2)：
+  # 雙卡平行 (預設)
+  python local_llm_inference.py \
+      --gguf models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf \
+      --devices 0,1
+
+  # 單卡
+  python local_llm_inference.py --gguf <path> --devices 0
 """
 
 from __future__ import annotations
 
 import argparse
-import collections
 import concurrent.futures
 import datetime as _dt
 import json
@@ -31,8 +34,9 @@ import time
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
-import requests
 from tqdm.auto import tqdm
+
+Llama = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -50,108 +54,16 @@ def _configure_stdout() -> None:
                 pass
 
 
-_LOG_LOCK = threading.Lock()
-
-
 def log(msg: str) -> None:
-    with _LOG_LOCK:
-        try:
-            tqdm.write(msg)
-        except UnicodeEncodeError:
-            sys.stdout.buffer.write((msg + "\n").encode("utf-8", errors="replace"))
-            sys.stdout.flush()
-
-
-# ---------------------------------------------------------------------------
-# Rate limiter
-# ---------------------------------------------------------------------------
-
-class RateLimiter:
-    """限制 60 秒滑動視窗內的呼叫次數，thread-safe。"""
-
-    def __init__(self, max_calls: int, window_seconds: float = 60.0) -> None:
-        if max_calls <= 0:
-            raise ValueError("max_calls 必須 > 0")
-        self.max_calls = max_calls
-        self.window = window_seconds
-        self._timestamps: "collections.deque[float]" = collections.deque()
-        self._lock = threading.Lock()
-
-    def acquire(self) -> None:
-        while True:
-            with self._lock:
-                now = time.monotonic()
-                cutoff = now - self.window
-                while self._timestamps and self._timestamps[0] <= cutoff:
-                    self._timestamps.popleft()
-                if len(self._timestamps) < self.max_calls:
-                    self._timestamps.append(now)
-                    return
-                wait_until = self._timestamps[0] + self.window
-            sleep_for = max(0.05, wait_until - time.monotonic())
-            time.sleep(sleep_for)
-
-
-# ---------------------------------------------------------------------------
-# NIM API
-# ---------------------------------------------------------------------------
-
-INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL_NAME = "google/gemma-4-31b-it"
-
-
-def load_api_keys(filepath: str) -> List[str]:
-    """從 api_key.txt 讀出所有 API key (一行一把，忽略空行 / # 註解)。"""
-    if not os.path.exists(filepath):
-        log(f"[FATAL] 找不到 API Key 檔案 '{filepath}'"); sys.exit(1)
-    keys: List[str] = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            keys.append(stripped)
-    if not keys:
-        log(f"[FATAL] API Key 檔案 '{filepath}' 是空的"); sys.exit(1)
-    return keys
-
-
-def query_llm(prompt: str, api_key: str, model_name: str, timeout: float,
-              temperature: float, top_p: float) -> str:
-    """NIM API + assistant prefix `Answer: ` trick + max_tokens=4 + stop=["\n"]。"""
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "user", "content": prompt},
-            # vLLM/TensorRT-LLM 後端會把這當成 generation prefix 直接續寫
-            {"role": "assistant", "content": "Answer: "},
-        ],
-        "max_tokens": 4,
-        "temperature": temperature,
-        "top_p": top_p,
-        "stop": ["\n"],
-        "stream": False,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
     try:
-        r = requests.post(INVOKE_URL, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        d = r.json()
-        if "choices" in d and isinstance(d["choices"], list) and d["choices"]:
-            content = d["choices"][0].get("message", {}).get("content", "")
-            return content.strip() if content else "[Error] 空白回應"
-        return "[Error] API 回應格式不符 (無 choices)"
-    except requests.exceptions.RequestException as exc:
-        return f"[Error] API 請求失敗: {exc}"
-    except json.JSONDecodeError:
-        return "[Error] 無法解析 JSON"
-    except Exception as exc:  # pragma: no cover
-        return f"[Error] 例外: {exc}"
+        tqdm.write(msg)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write((msg + "\n").encode("utf-8", errors="replace"))
+        sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
-# Answer parser
+# Answer parser — 多層 regex 回退
 # ---------------------------------------------------------------------------
 
 _ANSWER_LINE_RE = re.compile(r"(?i)\banswer\s*[:：=\-]\s*\*{0,2}\(?\s*([A-H])\s*\)?")
@@ -184,6 +96,7 @@ def extract_answer_letter(response_text: str, valid_letters: Set[str]) -> str:
 # 預設 ambiguity-heavy 3-shot (Kaggle LB 0.95197 ensemble 用的同樣 examples)
 _FEWSHOT_IDS_DEFAULT: List[int] = [3961, 9642, 3547]
 
+# 載入後 cache，避免每次重讀 train.jsonl
 _EXAMPLES_CACHE: Optional[str] = None
 _CACHED_IDS: Optional[List[int]] = None
 
@@ -250,8 +163,8 @@ def _load_fewshot_examples(ids: List[int],
                 if len(found) == len(wanted):
                     break
     if len(found) != len(wanted):
-        log(f"[FATAL] 找不到 few-shot 範例 ids: {wanted - set(found.keys())}")
-        sys.exit(1)
+        missing = wanted - set(found.keys())
+        log(f"[FATAL] 找不到 few-shot 範例 ids: {missing}"); sys.exit(1)
     return [found[sid] for sid in ids]
 
 
@@ -270,6 +183,7 @@ def _get_examples_block(ids: List[int]) -> str:
 
 def build_prompt(full_context: str, current_step: str, options: Dict[str, dict],
                  fewshot_ids: List[int]) -> str:
+    """Concise prompt + N-shot in-context examples."""
     options_block = "\n".join(
         _format_tool(letter, options[letter]) for letter in sorted(options.keys())
     )
@@ -318,7 +232,7 @@ def load_existing_results(path: str) -> Dict[int, dict]:
             data = json.load(f)
         return {int(r["id"]): r for r in data if "id" in r}
     except Exception as exc:
-        log(f"[WARN] 讀取 {path} 失敗: {exc}")
+        log(f"[WARN] 讀取 {path} 失敗，視為空: {exc}")
         return {}
 
 
@@ -359,12 +273,79 @@ def _build_submission_rows(samples: List[dict],
 
 
 # ---------------------------------------------------------------------------
+# Llama wrapper
+# ---------------------------------------------------------------------------
+
+def make_llama(gguf_path: str, device_idx: int, n_gpu_layers: int,
+               n_ctx: int, n_threads: int, n_batch: int, seed: int):
+    """載入一份 Llama 實例，整顆 pin 到 device_idx。"""
+    global Llama
+    if Llama is None:
+        from llama_cpp import Llama as _Llama
+        Llama = _Llama
+    log(f"[INFO] 載入 GGUF 到 GPU {device_idx}: {gguf_path}")
+    t0 = time.time()
+    llm = Llama(
+        model_path=gguf_path,
+        n_gpu_layers=n_gpu_layers,
+        n_ctx=n_ctx,
+        n_threads=n_threads,
+        n_batch=n_batch,
+        seed=seed,
+        verbose=False,
+        main_gpu=device_idx,
+        split_mode=0,  # LLAMA_SPLIT_MODE_NONE — 整顆放在 main_gpu
+    )
+    log(f"[INFO] GPU {device_idx} 模型載入完成，耗時 {time.time() - t0:.1f}s "
+        f"(n_ctx={n_ctx})")
+    return llm
+
+
+class LlmWorker:
+    """一張 GPU + 一份 Llama 實例 + 一把鎖。"""
+
+    def __init__(self, llm, device_idx: int) -> None:
+        self.llm = llm
+        self.device_idx = device_idx
+        self.lock = threading.Lock()
+
+
+def _wrap_qwen3_no_think(user_msg: str) -> str:
+    """Qwen3.6 ChatML + 空 <think></think> block (跳過 thinking)。"""
+    return (
+        "<|im_start|>user\n"
+        + user_msg
+        + "\n<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
+
+def query_local_llm(llm, prompt: str, max_tokens: int,
+                    temperature: float, top_p: float) -> str:
+    try:
+        wrapped = _wrap_qwen3_no_think(prompt)
+        resp = llm.create_completion(
+            prompt=wrapped,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=["<|im_end|>", "<|endoftext|>"],
+        )
+        choices = resp.get("choices") or []
+        if not choices:
+            return "[Error] no choices"
+        text = choices[0].get("text") or ""
+        return text.strip() if text else "[Error] empty content"
+    except Exception as exc:
+        return f"[Error] inference exception: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
 
-def process_sample(sample: dict, api_key: str, rate_limiter: RateLimiter,
-                   model_name: str, fewshot_ids: List[int],
-                   max_attempts: int,
+def process_sample(llm, sample: dict, fewshot_ids: List[int],
+                   max_attempts: int, max_tokens: int,
                    temperature: float, top_p: float,
                    previous_best: Optional[dict] = None) -> dict:
     sample_id = sample["id"]
@@ -388,10 +369,8 @@ def process_sample(sample: dict, api_key: str, rate_limiter: RateLimiter,
         }
 
     for attempt in range(1, max_attempts + 1):
-        rate_limiter.acquire()
-        timeout = 120.0 if attempt <= 2 else min(180.0 + 30.0 * (attempt - 3), 360.0)
-        response_text = query_llm(prompt, api_key, model_name, timeout,
-                                  temperature, top_p)
+        t = temperature if attempt == 1 else min(temperature + 0.05 * attempt, 0.1)
+        response_text = query_local_llm(llm, prompt, max_tokens, t, top_p)
         last_response = response_text
         letter = extract_answer_letter(response_text, valid_letters)
         if letter:
@@ -403,7 +382,6 @@ def process_sample(sample: dict, api_key: str, rate_limiter: RateLimiter,
         elif attempt == max_attempts:
             log(f"[WARN] id={sample_id} 用盡 {max_attempts} 次仍無合法 letter；"
                 f"raw={response_text[:80]!r}")
-        time.sleep(min(2.0 * attempt, 30.0))
 
     return {
         "id": sample_id,
@@ -414,24 +392,19 @@ def process_sample(sample: dict, api_key: str, rate_limiter: RateLimiter,
 
 
 def run_pipeline(input_path: str, output_csv: str, backup_json: str,
-                 api_key_path: str, model_name: str,
-                 fewshot_ids: List[int],
-                 max_attempts: int, rate_per_minute: int,
-                 workers_per_key: int,
-                 temperature: float, top_p: float,
-                 save_every: int) -> None:
-    api_keys = load_api_keys(api_key_path)
+                 gguf_path: str, devices: List[int], fewshot_ids: List[int],
+                 n_gpu_layers: int, n_ctx: int, n_threads: int, n_batch: int,
+                 seed: int, max_attempts: int, max_tokens: int,
+                 temperature: float, top_p: float, save_every: int) -> None:
     samples = load_jsonl(input_path)
     log(f"載入 {len(samples)} 筆樣本：{input_path}")
-    log(f"使用模型：{model_name}")
+    # 預先載入 examples
     _ = _get_examples_block(fewshot_ids)
 
     existing = load_existing_results(backup_json)
     if existing:
         log(f"偵測到既有結果 {len(existing)} 筆：{backup_json}")
     results_by_id: Dict[int, dict] = dict(existing)
-    results_lock = threading.Lock()
-    save_lock = threading.Lock()
 
     to_process: List[dict] = []
     skipped = 0
@@ -444,30 +417,46 @@ def run_pipeline(input_path: str, output_csv: str, backup_json: str,
         else:
             to_process.append(sample)
 
-    n_keys = len(api_keys)
-    total_workers = workers_per_key * n_keys
     log(f"沿用 {skipped} 筆；需要重打 {len(to_process)} 筆")
-    log(f"{n_keys} 把 API key × {workers_per_key} workers = {total_workers} threads；"
-        f"每把 key rate limit {rate_per_minute} calls/min")
+    if not to_process:
+        rows = _build_submission_rows(samples, results_by_id)
+        save_outputs(output_csv, backup_json, rows, results_by_id)
+        return
 
-    rate_limiters = [RateLimiter(max_calls=rate_per_minute) for _ in api_keys]
+    log(f"準備在 {len(devices)} 張 GPU 上各載入一份模型: {devices}")
+    workers: List[LlmWorker] = []
+    for dev in devices:
+        llm = make_llama(
+            gguf_path=gguf_path, device_idx=dev,
+            n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
+            n_threads=n_threads, n_batch=n_batch, seed=seed,
+        )
+        workers.append(LlmWorker(llm, dev))
+    n_workers = len(workers)
+    log(f"[INFO] 共 {n_workers} 條 worker thread")
 
+    results_lock = threading.Lock()
+    save_lock = threading.Lock()
     completed = 0
     total = len(to_process)
 
-    def _worker(sample: dict, key_idx: int) -> str:
+    def _worker_fn(sample: dict, worker_idx: int) -> str:
         sid = sample["id"]
+        w = workers[worker_idx]
         with results_lock:
             prev = results_by_id.get(sid)
         try:
-            result = process_sample(
-                sample, api_keys[key_idx], rate_limiters[key_idx],
-                model_name, fewshot_ids,
-                max_attempts, temperature, top_p,
-                previous_best=prev,
-            )
+            with w.lock:
+                result = process_sample(
+                    w.llm, sample, fewshot_ids,
+                    max_attempts=max_attempts,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    previous_best=prev,
+                )
         except Exception as exc:  # pragma: no cover
-            log(f"[WARN] id={sid} 例外: {exc}")
+            log(f"[WARN] id={sid} (GPU {w.device_idx}) 例外: {exc}")
             result = prev or {
                 "id": sid,
                 "current_step": sample.get("current_step", ""),
@@ -477,28 +466,27 @@ def run_pipeline(input_path: str, output_csv: str, backup_json: str,
             results_by_id[sid] = result
         return result.get("predicted_answer", "") or ""
 
-    if to_process:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=total_workers) as ex, \
-                tqdm(total=len(samples), initial=skipped, desc="處理", unit="q",
-                     dynamic_ncols=True) as bar:
-            futures = {
-                ex.submit(_worker, sample, i % n_keys): sample
-                for i, sample in enumerate(to_process)
-            }
-            for future in concurrent.futures.as_completed(futures):
-                completed += 1
-                try:
-                    future.result()
-                except Exception as exc:
-                    log(f"[WARN] worker fail: {exc}")
-                bar.update(1)
-                if completed % save_every == 0 or completed == total:
-                    with save_lock, results_lock:
-                        rows = _build_submission_rows(samples, results_by_id)
-                        try:
-                            save_outputs(output_csv, backup_json, rows, results_by_id)
-                        except Exception as exc:
-                            log(f"[WARN] flush 失敗: {exc}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex, \
+            tqdm(total=len(samples), initial=skipped, desc="處理", unit="q",
+                 dynamic_ncols=True) as bar:
+        future_to_sample = {
+            ex.submit(_worker_fn, sample, i % n_workers): sample
+            for i, sample in enumerate(to_process)
+        }
+        for future in concurrent.futures.as_completed(future_to_sample):
+            completed += 1
+            try:
+                future.result()
+            except Exception as exc:
+                log(f"[WARN] worker fail: {exc}")
+            bar.update(1)
+            if completed % save_every == 0 or completed == total:
+                with save_lock, results_lock:
+                    rows = _build_submission_rows(samples, results_by_id)
+                    try:
+                        save_outputs(output_csv, backup_json, rows, results_by_id)
+                    except Exception as exc:
+                        log(f"[WARN] flush 失敗: {exc}")
 
     with save_lock, results_lock:
         rows = _build_submission_rows(samples, results_by_id)
@@ -510,34 +498,50 @@ def run_pipeline(input_path: str, output_csv: str, backup_json: str,
 # CLI
 # ---------------------------------------------------------------------------
 
+def _parse_devices(s: str) -> List[int]:
+    parts = [p for p in re.split(r"[,;\s]+", s.strip()) if p]
+    try:
+        devices = [int(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--devices 必須是整數或以逗號分隔 (got {s!r})") from exc
+    if not devices or len(devices) > 2 or len(set(devices)) != len(devices):
+        raise argparse.ArgumentTypeError(f"--devices 必須是 1 或 2 個唯一整數 (got {devices})")
+    return devices
+
+
 def _parse_fewshot_ids(s: str) -> List[int]:
     return [int(x) for x in re.split(r"[,;\s]+", s.strip()) if x]
 
 
 def slugify(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_") or "model"
+    return re.sub(r"[^A-Za-z0-9]+", "_", os.path.basename(name)).strip("_") or "model"
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="HW4 NIM gemma-4-31b + ambiguity-heavy 3-shot")
+        description="HW4 local Qwen3.6 + ambiguity-heavy 3-shot inference")
     p.add_argument("--input", default=os.path.join("data", "test.jsonl"))
     p.add_argument("--output-dir", default=None)
     p.add_argument("--output", default="submission.csv")
     p.add_argument("--backup", default="llm_answering_results.json")
-    p.add_argument("--api-key", default="api_key.txt")
-    p.add_argument("--model", default=MODEL_NAME)
+    p.add_argument("--gguf", required=True, help="GGUF 檔路徑")
+    p.add_argument("--devices", type=_parse_devices, default=[0, 1],
+                   help="GPU index (1 或 2 張)，預設 '0,1'")
     p.add_argument("--fewshot-ids", type=_parse_fewshot_ids,
                    default=_FEWSHOT_IDS_DEFAULT,
                    help=f"逗號分隔的 train.jsonl id (預設 ambig: {_FEWSHOT_IDS_DEFAULT})")
-    p.add_argument("--max-attempts", type=int, default=8)
-    p.add_argument("--rate", type=int, default=37,
-                   help="每把 key 60 秒內最多呼叫次數 (預設 37)")
-    p.add_argument("--workers", type=int, default=4,
-                   help="每把 key 的 worker thread 數 (預設 4)")
-    p.add_argument("--save-every", type=int, default=10)
-    p.add_argument("--temperature", type=float, default=0.1)
-    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--n-gpu-layers", type=int, default=-1)
+    p.add_argument("--n-ctx", type=int, default=8192,
+                   help="3-shot prompt ~5000 tokens；預設 8192")
+    p.add_argument("--n-threads", type=int, default=8)
+    p.add_argument("--n-batch", type=int, default=512)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-tokens", type=int, default=16)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=0.1)
+    p.add_argument("--max-attempts", type=int, default=4)
+    p.add_argument("--save-every", type=int, default=25)
     return p.parse_args()
 
 
@@ -546,23 +550,28 @@ def main() -> None:
     args = parse_args()
     output_dir = args.output_dir or os.path.join(
         "outputs",
-        f"hw4_{slugify(args.model.replace('/', '_'))}_"
+        f"hw4_local_{slugify(args.gguf)}_"
         f"{_dt.datetime.now().strftime('%m%d%H%M')}",
     )
     os.makedirs(output_dir, exist_ok=True)
     output_csv = os.path.join(output_dir, args.output)
     backup_json = os.path.join(output_dir, args.backup)
     log(f"輸出資料夾: {output_dir}")
+
     run_pipeline(
         input_path=args.input,
         output_csv=output_csv,
         backup_json=backup_json,
-        api_key_path=args.api_key,
-        model_name=args.model,
+        gguf_path=args.gguf,
+        devices=args.devices,
         fewshot_ids=args.fewshot_ids,
+        n_gpu_layers=args.n_gpu_layers,
+        n_ctx=args.n_ctx,
+        n_threads=args.n_threads,
+        n_batch=args.n_batch,
+        seed=args.seed,
         max_attempts=args.max_attempts,
-        rate_per_minute=args.rate,
-        workers_per_key=args.workers,
+        max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
         save_every=args.save_every,
