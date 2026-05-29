@@ -37,33 +37,38 @@
 
 #align(center)[
   #box(stroke: 0.4pt, inset: 6pt, radius: 3pt)[
-    `test.jsonl` → *prompt builder* → *LLM (gemma-4-31b-it)* → *answer parser (multi-tier regex)* → *resume-safe writer* → `submission.csv`
+    `test.jsonl` → *prompt builder (concise + 3-shot)* → *LLM (gemma-4-31b-it)* → *answer parser (multi-tier regex)* → *resume-safe writer* → `submission.csv`
   ]
 ]
 
 關鍵模組：
 
-+ *Prompt builder* (`build_prompt`)：把 `full_context`, `current_step` 與 `options` 中每個工具的 (name, description, arguments.properties, results.properties) 組成單一 user message，並在尾段明確要求模型在獨立一行輸出 `Answer: <LETTER>`。Prompt 內也列出歧義例 (`search_train` vs `query_past_ticket`) 作為 disambiguation 提示。
-+ *Multi-tier answer parser* (`extract_answer_letter`)：以五級回退規則從模型回應抽出唯一字母——`Answer: X` 行 → `<answer>X</answer>` → `**X**` → `` `X` `` → 取最後一個出現在 `valid_letters` 內的 standalone letter。確保即使模型寫了一整段散文也能穩定抽到答案。
++ *Prompt builder* (`build_prompt`)：以 concise 指令明確要求模型輸出單一大寫字母 (`Output ONLY a single uppercase letter ... No explanation`)，並在 user message 開頭預先給 *3 個 in-context examples*，每個 example 完整呈現 `full_context` / `current_step` / 每個工具的 (name, description, args.properties, results.properties) 與正解 `Answer: X`。
++ *Few-shot 範例設計*：刻意挑選工具家族高度同前綴的訓練樣本來示範如何 disambiguate (詳見 Q3)：
+  - `id=3961` (gold C, 4 工具全為 `home_cleaning_*` — booking / changing / query / cancelling)
+  - `id=9642` (gold E, 5 工具含 `foreign_currency_query` / `_purchase` / `_sale`)
+  - `id=3547` (gold C, 4 工具含 `search_train` / `train_ticket_query` / `train_ticket_booking` / `train_ticket_cancelling`)
++ *Multi-tier answer parser* (`extract_answer_letter`)：以五級回退規則從模型回應抽出唯一字母——`Answer: X` 行 → `<answer>X</answer>` → `**X**` → `` `X` `` → 取最後一個出現在 `valid_letters` 內的 standalone letter。確保即使模型寫了散文也能穩定抽到答案。
++ *Assistant prefix-trick + 短輸出*：API request 的 messages 末尾加上 `{role: assistant, content: "Answer: "}` 並設 `max_tokens=4` + `stop=["\n"]`，讓模型只需生成 1 個 token；單筆延遲 ~0.5s。
 
 == 本地推論版 (供 Q2 / Q3 相同模型對照)
 
-`local_llm_inference.py` 把同一條 pipeline 換到 *Qwen3.6-27B-Q4_K_M GGUF* + llama-cpp-python。
-
-Prompt + parser 與`HW4_111550132.py`完全對齊，方便 Q2 比較。
+`local_llm_inference.py` 把同一條 pipeline 換到 *Qwen3.6-27B-Q4_K_M GGUF* + llama-cpp-python。Prompt 結構 (concise + 3-shot)、範例 ids、parser、retry 邏輯與 `HW4_111550132.py` 完全對齊，唯一差異在後端推論呼叫 (`llama_cpp.Llama.create_completion`)。
 
 == Kaggle 結果
 
 #align(center)[
   #table(
     columns: (auto, auto, auto, auto),
-    align: (left, center, center, left),
+    align: (left, left, center, left),
     stroke: 0.5pt,
     table.header(
-      [*提交*], [*模型*], [*Public LB*], [*備註*]
+      [*提交*], [*Pipeline*], [*Public LB*], [*備註*]
     ),
-    [#1], [`gemma-4-31b-it` (NIM)], [*0.90112*], [Prompt + Full-Info，thinking off],
-    [#2], [`Qwen3.6-27B` Q4_K_M (local)], [0.87005], [Prompt + Full-Info，thinking off],
+    [#1], [gemma-4-31b-it concise, zero-shot], [0.90112], [],
+    [#2], [Qwen3.6-27B Q4_K_M concise, zero-shot], [0.93785], [],
+    [#3], [gemma-4-31b-it + ambig 3-shot, T=0.1], [*0.94915*], [`HW4_111550132.py`],
+    [#4], [Qwen3.6-27B Q4_K_M + ambig 3-shot, T=0.0], [0.94350], [`local_llm_inference.py`],
   )
 ]
 
@@ -131,8 +136,21 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
 
 == 處理 Ambiguity 的策略
 
-主 pipeline 同時用了三層手段：
+主 pipeline 同時用了四層手段：
 
++ *In-context examples (3-shot)*。提交版本的 prompt 預先給 3 個從 `train.jsonl` 挑出的範例，這 3 個範例之所以被挑中，正是因為它們的候選工具集本身就是「同前綴變體」的極端 ambiguity case，明確示範了 disambiguation 的標準解法：
+  #align(center)[
+    #table(
+      columns: (auto, auto, auto),
+      align: (left, left, left),
+      stroke: 0.5pt,
+      table.header([*Example id*], [*Gold*], [*Ambiguity 結構*]),
+      [`3961`], [C], [4 工具全為 `home_cleaning_*` (booking / changing / query / cancelling) — 6 個工具兩兩配對全部 Jaccard ≥ 0.5；示範如何從 `current_step` 的動詞 ("Check") 對應到 `query`],
+      [`9642`], [E], [5 工具中 3 個 `foreign_currency_*` (purchase / query / sale)；示範如何處理 train 罕見但 test 常見的 gold letter (E)],
+      [`3547`], [C], [4 工具含 `search_train` / `train_ticket_query` / `train_ticket_booking` / `train_ticket_cancelling` — 直接覆蓋 spec 提到的歧義範例],
+    )
+  ]
+  此設計把「拆解 verb-vs-resource 並選正確 verb」的思維直接示範給 model，在 gemma 上把 LB 從 0.93220 (zero-shot) 推到 0.94915，純 prompt 改造的最大幅突破。
 + *Prompt 中明確提點歧義範例*。`build_prompt` 的 reasoning guidelines 直接寫：
   ```
   Two tools may have similar names (e.g. `search_train` vs `query_past_ticket`);
@@ -202,29 +220,33 @@ SFT 設定：QLoRA on Qwen3.6-27B 以 NF4 + double quant 4-bit 量化，LoRA r=8
   [`HW4_111550132.py`],
   [Kaggle 主提交 pipeline (NIM API + gemma-4-31b-it)，多 API key + worker pool],
   [`local_llm_inference.py`],
-  [本地 GGUF 推論 (llama-cpp-python)，單卡 / 雙卡平行版本],
+  [本地 GGUF 推論 (llama-cpp-python)，預設雙卡平行執行],
   [`run_dev_eval.py`],
-  [Dev set 評估腳本，支援 `--prompt-mode {full, struct}` 兩種 configuration + Q3 ambiguity 錯誤分類],
+  [Dev set 評估腳本，支援 `--prompt-mode {full, struct}` 兩種 configuration + Q3 ambiguity 錯誤分類 (`evaluate_and_analyze`)],
   [`train_sft.py`],
   [QLoRA fine-tuning on Qwen3.6-27B (4-bit base + LoRA on attention)，對應 Q2 SFT × {Full, Struct}],
   [`eval_sft.py`],
-  [SFT 後評估腳本 (transformers + peft adapter)，沿用 `run_dev_eval` 的 prompt 與 evaluation 邏輯],
+  [Dev set SFT 後評估 (transformers + peft adapter)，沿用 `run_dev_eval` 的 prompt 與 evaluation 邏輯],
+  [`predict_sft.py`],
+  [Test set SFT 後推論 (transformers + peft adapter)，雙卡平行；輸出可供 Kaggle 提交],
   [`data/dev.jsonl`],
   [從 `train.jsonl` 取最後 1000 筆，所有 dev 實驗共用同一份以確保 4-cell 可比性],
 )
 
 == 執行方式 (`HW4_111550132.py`)
 
-*前置*：在執行目錄下放 `api_key.txt` (NVIDIA NIM key)，並把 `test.jsonl` 放在 `data/test.jsonl`。
+*前置*：在執行目錄下放 `api_key.txt` (NVIDIA NIM key)、`test.jsonl` 在 `data/test.jsonl`、`train.jsonl` 在 `data/train.jsonl`
+
 ```
 python HW4_111550132.py \
     --input data/test.jsonl \
     --output submission.csv \
     --backup llm_answering_results.json \
     --model google/gemma-4-31b-it \
-    --max-attempts 10 \
-    --rate 37 \
-    --workers 4
+    --fewshot-ids 3961,9642,3547 \
+    --temperature 0.1 --top-p 0.95 \
+    --max-attempts 8 \
+    --rate 37 --workers 4
 ```
 
-*Resume*：腳本每完成一筆就 flush CSV 與 backup JSON，中斷後再次執行只會重打仍無合法 letter 的 id；既有正確答案會直接沿用。
+*Resume*：腳本每完成 `save-every` 筆就 flush CSV 與 backup JSON，中斷後再次執行只會重打仍無合法 letter 的 id；既有正確答案會直接沿用。
